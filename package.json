@@ -1,0 +1,18 @@
+{
+  "name": "pi-worktree-guard",
+  "version": "0.1.0",
+  "description": "Worktree guard for pi \u2014 sessions claim the shared git checkout via heartbeat files under .git/pi-agent-claims/ and mutating git ops (stash/checkout/switch/reset --hard/clean) are blocked on the main checkout while another live pi session occupies it. Policy: one branch = one worktree = one agent.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pfgoriaux/pi-worktree-guard.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/worktree-guard.ts"
+    ]
+  }
+}
