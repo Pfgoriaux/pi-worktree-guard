@@ -1,6 +1,8 @@
 # pi-worktree-guard
 
-> Policy: **one branch = one worktree = one agent.**
+> Workflow goal: one branch and one worktree per agent.
+> The implementation guards selected Git operations on shared main checkouts;
+> it does not enforce exclusive access to every worktree.
 
 Blocks concurrent pi sessions from running each other over on a shared git
 checkout. Born from a real incident: a second agent, needing a different
@@ -15,7 +17,8 @@ note.
    <host>-<pid>.json` (branch, pid, heartbeat timestamp). Claims are
    heartbeat-refreshed every 30 s while pi runs, deleted on session
    shutdown, and garbage-collected once their pid is dead or their heartbeat
-   is stale (>10 min). Linked worktrees never claim — they cannot collide.
+   is stale (>10 min). Linked worktrees do not claim; users must assign a
+   distinct worktree to each agent to avoid collisions there.
 
 2. **Block** — when a `bash` tool call would run a git op that moves HEAD or
    hides/destroys work **on the main checkout while another live pi session
@@ -29,7 +32,7 @@ note.
 ## What it does NOT block
 
 - Anything inside a **linked worktree** (`herdr worktree create`, `git
-  worktree add`) — that's the blessed state, guard steps aside.
+  worktree add`). This assumes agents are assigned different worktrees.
 - Anything in a repo **no other live session claims** — single-agent flow is
   untouched, routine `git checkout` alone in the main checkout is fine.
 - `git stash list` / `git stash show` (read-only), non-`--hard` resets,
@@ -47,27 +50,32 @@ note.
   in a claimed checkout is blocked even though the scanner cannot parse the
   nested invocation. Parse failures on plain commands fall through to git's
   own errors instead.
-- The escape hatch is **human-shaped on purpose**: relaunch pi with
-  `PI_WORKTREE_GUARD=0`. Setting it inside a bash tool call only affects
-  that subshell, not the guard, so agents cannot disable themselves.
+- An operator can disable the guard for a pi process with `PI_WORKTREE_GUARD=0`.
+  Setting that variable inside a bash tool call does not change the current
+  parent process. This is an operational switch, not a security boundary against
+  an agent that can launch other processes or edit files.
+- Claim I/O errors and exceptions in the outer tool-call handler fail open.
+  The guard only inspects pi `bash` calls; arbitrary edits, other tools, external
+  processes, and two sessions sharing one linked worktree are outside its coverage.
 - Claims and check state live under `.git/` — nothing tracked by git, no
   merge noise, no repo pollution.
 
 ## Install
 
-In `~/.pi/agent/settings.json`:
-
-```json
-{
-	"packages": ["../../dev/pi/extensions/pi-worktree-guard"]
-}
+```bash
+pi install git:github.com/Pfgoriaux/pi-worktree-guard
+# Or this workspace's local checkout:
+pi install /Users/pf/eden/tools/pi/extensions/pi-worktree-guard
 ```
+
+Reload pi after installation. Local paths in settings resolve relative to the
+settings file, not the workspace.
 
 ## Companion rules
 
-The AGENTS.md rule this enforces lives in each repo's instructions:
-concurrent sessions use worktrees, and work is committed before being
-reported done — a stash is not a deliverable.
+Use distinct worktrees for concurrent sessions. Report uncommitted changes
+honestly; committing or pushing still requires the user's authorization. This
+guard does not require a commit before reporting work done.
 
 
 ## The pi extension family
@@ -77,7 +85,7 @@ Five packages, one workflow: plan, fan out, review, protect, verify.
 | Package | Job |
 |---|---|
 | [pi-dispatch](https://github.com/Pfgoriaux/pi-dispatch) | parallel sub-agent fan-out, merge-back, Herdr arborescence |
-| [pi-feature-swarm](https://github.com/Pfgoriaux/pi-feature-swarm) | read-only multi-model feature discovery & planning |
+| [pi-feature-swarm](https://github.com/Pfgoriaux/pi-feature-swarm) | multi-model feature discovery & planning, no code changes intended |
 | [pi-pr-swarm](https://github.com/Pfgoriaux/pi-pr-swarm) | multi-model PR review, then aggregate & fix |
-| [pi-worktree-guard](https://github.com/Pfgoriaux/pi-worktree-guard) | one branch = one worktree = one agent |
+| [pi-worktree-guard](https://github.com/Pfgoriaux/pi-worktree-guard) | best-effort guard against conflicting Git operations in a shared main checkout |
 | [pi-repo-check](https://github.com/Pfgoriaux/pi-repo-check) | repo hygiene gate: conventions, docs-in-pairs, baseline |
