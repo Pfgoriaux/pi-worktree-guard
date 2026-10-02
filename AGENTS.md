@@ -1,7 +1,5 @@
 # pi-worktree-guard
 
-Read and follow [shared working rules](RULES.MD).
-
 A best-effort guard against one pi session stashing, switching, or discarding
 another session's work in a shared main checkout. It supports separate worktrees;
 it does not enforce exclusive ownership of every worktree. See [README.md](README.md).
