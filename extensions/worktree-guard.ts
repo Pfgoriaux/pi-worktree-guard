@@ -21,9 +21,14 @@
  *      another live pi session currently claims, the call is blocked with a
  *      reason telling the agent how to proceed (use its own worktree / ask
  *      the user).
+ *   3. LOCATION — `git worktree add <path>` for a repo inside the workspace
+ *      (the parent of `PI_WORKTREE_ROOT`, default `~/eden/.worktrees`) is
+ *      blocked unless <path> sits under the repo's mirrored folder, e.g.
+ *      `~/eden/products/app` -> `~/eden/.worktrees/products/app/<branch>`.
+ *      This applies to every session, claimed or not.
  *
  * Not blocked, by design:
- *   - anything in a linked worktree (`herdr worktree create` / `git worktree add`)
+ *   - mutating ops inside a linked worktree
  *   - anything in a repo no other live session claims (single-agent flow)
  *   - `git stash list` / `git stash show` (read-only)
  *   - commands outside a git repository (git itself will error)
@@ -69,6 +74,9 @@ const GIT_FLAG_WITH_VALUE = new Set(["-c", "--git-dir", "--work-tree", "--namesp
 
 /** Interpreters/wrappers that hide a nested git invocation. */
 const INDIRECT_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ssh", "xargs", "envx"]);
+
+/** `git worktree add` options that consume a separate value token. */
+const WORKTREE_ADD_FLAG_WITH_VALUE = new Set(["-b", "-B", "--reason"]);
 
 /** Cheap pre-filter regexes (used only for the indirect path). */
 const MUTATION_HINT_RE = /\b(?:checkout|switch|stash|reset|clean)\b/;
@@ -133,11 +141,18 @@ function unquote(token: string): string {
 	return token.replace(/^["']|["']$/g, "");
 }
 
-/**
- * Does this git argv mutate HEAD or hide/destroy work? Returns a description
- * of the op and the directory it targets (honouring `git -C <path>`).
- */
-function gitMutation(argv: string[], cwd: string): MutationHit | null {
+function expandHome(p: string): string {
+	return p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+interface GitCall {
+	dir: string;
+	op: string | undefined;
+	args: string[];
+}
+
+/** Split a git argv into the directory it runs in, the subcommand and its args. */
+function parseGit(argv: string[], cwd: string): GitCall | null {
 	// argv[0] === "git"
 	const rest = argv.slice(1);
 	let dir = cwd;
@@ -146,7 +161,7 @@ function gitMutation(argv: string[], cwd: string): MutationHit | null {
 		const t = rest[i];
 		if (t === "-C") {
 			if (i + 1 >= rest.length) return null; // malformed — git errors on its own
-			dir = path.resolve(cwd, unquote(rest[i + 1]));
+			dir = path.resolve(dir, expandHome(unquote(rest[i + 1])));
 			i += 2;
 			continue;
 		}
@@ -160,8 +175,17 @@ function gitMutation(argv: string[], cwd: string): MutationHit | null {
 		}
 		break;
 	}
-	const op = rest[i];
-	const args = rest.slice(i + 1);
+	return { dir, op: rest[i], args: rest.slice(i + 1) };
+}
+
+/**
+ * Does this git argv mutate HEAD or hide/destroy work? Returns a description
+ * of the op and the directory it targets (honouring `git -C <path>`).
+ */
+function gitMutation(argv: string[], cwd: string): MutationHit | null {
+	const call = parseGit(argv, cwd);
+	if (!call) return null;
+	const { dir, op, args } = call;
 	switch (op) {
 		case "stash": {
 			const sub = args[0] ?? "";
@@ -185,17 +209,88 @@ function gitMutation(argv: string[], cwd: string): MutationHit | null {
 	}
 }
 
+export interface WorktreeAdd {
+	/** Directory git runs in. */
+	dir: string;
+	/** Absolute path of the new worktree. */
+	target: string;
+	/** Branch named by `-b`/`-B`, if any. */
+	branch?: string;
+}
+
+/** Parse `git [-C dir] worktree add [opts] <path> [<commit-ish>]`. */
+export function worktreeAdd(argv: string[], cwd: string): WorktreeAdd | null {
+	const call = parseGit(argv, cwd);
+	if (call?.op !== "worktree" || call.args[0] !== "add") return null;
+	// Git permutes options, so `-b <branch>` may follow the path.
+	const args = call.args.slice(1).map(unquote);
+	const positional: string[] = [];
+	let branch: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i];
+		if (t === "--") {
+			positional.push(...args.slice(i + 1));
+			break;
+		}
+		if (WORKTREE_ADD_FLAG_WITH_VALUE.has(t)) {
+			if (t !== "--reason") branch = args[i + 1];
+			i++;
+		} else if (!t.startsWith("-")) {
+			positional.push(t);
+		}
+	}
+	if (positional.length === 0) return null;
+	return { dir: call.dir, target: path.resolve(call.dir, expandHome(positional[0])), branch };
+}
+
+/** Central worktree folder. Its parent directory is the workspace. */
+function centralRoot(): string {
+	return process.env.PI_WORKTREE_ROOT ?? path.join(os.homedir(), "eden", ".worktrees");
+}
+
+/**
+ * Mirrored worktree folder for the repo whose common git dir is `commonDir`,
+ * or null when the repo is bare or outside the workspace.
+ */
+export function mirroredRoot(commonDir: string, central: string = centralRoot()): string | null {
+	if (path.basename(commonDir) !== ".git") return null;
+	const rel = path.relative(path.dirname(central), path.dirname(commonDir));
+	if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+	return path.join(central, rel);
+}
+
+/** Branch name as a single directory name. */
+function branchDir(branch: string): string {
+	return branch.replaceAll("/", "-");
+}
+
+/** Block reason when `add.target` is outside `mirror`, else null. */
+export function locationViolation(add: WorktreeAdd, mirror: string): string | null {
+	if (add.target.startsWith(mirror + path.sep)) return null;
+	const dest = path.join(mirror, branchDir(add.branch ?? path.basename(add.target)));
+	return [
+		`pi-worktree-guard blocked \`git worktree add\` to ${add.target}.`,
+		`Worktrees for this repo go under ${mirror}/, one directory per branch with "/" replaced by "-".`,
+		`Rerun the same command with the worktree path replaced by ${dest}`,
+	].join("\n");
+}
+
 /**
  * Walk the command left-to-right, tracking `cd`/`pushd`, and collect every
- * mutating git op together with the directory it would run in.
+ * mutating git op and every `git worktree add`, with the directory each
+ * would run in.
  *
  * `indirect` is true when the command shells out through an interpreter or
  * wrapper AND the raw string mentions a mutating-looking git op — fail-closed
  * for nested invocations we cannot parse.
  */
-function scanCommand(command: string, baseDir: string): { hits: MutationHit[]; indirect: boolean } {
+export function scanCommand(
+	command: string,
+	baseDir: string,
+): { hits: MutationHit[]; adds: WorktreeAdd[]; indirect: boolean } {
 	let cwd = baseDir;
 	const hits: MutationHit[] = [];
+	const adds: WorktreeAdd[] = [];
 	for (const segment of splitShell(command)) {
 		const tokens = segment.trim().split(/\s+/).filter(Boolean);
 		let i = 0;
@@ -210,22 +305,22 @@ function scanCommand(command: string, baseDir: string): { hits: MutationHit[]; i
 		if (head === "cd" || head === "pushd") {
 			const target = argv.slice(1).find((t) => !t.startsWith("-"));
 			if (target) {
-				cwd = path.resolve(cwd, unquote(target));
+				cwd = path.resolve(cwd, expandHome(unquote(target)));
 			}
 			continue;
 		}
 		if (head === "git") {
 			const hit = gitMutation(argv, cwd);
-			if (hit) {
-				hits.push(hit);
-			}
+			if (hit) hits.push(hit);
+			const add = worktreeAdd(argv, cwd);
+			if (add) adds.push(add);
 			continue;
 		}
 		if (head !== undefined && INDIRECT_SHELLS.has(head) && MUTATION_HINT_RE.test(command)) {
-			return { hits, indirect: true };
+			return { hits, adds, indirect: true };
 		}
 	}
-	return { hits, indirect: false };
+	return { hits, adds, indirect: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -393,16 +488,32 @@ function releaseClaims(): void {
 // Extension
 // ---------------------------------------------------------------------------
 
-function blockReason(op: string, toplevel: string, rival: Claim): string {
+function blockReason(op: string, info: RepoInfo, rival: Claim): string {
+	const toplevel = info.toplevel;
+	const mirror = mirroredRoot(info.commonDir);
+	const addCmd = mirror
+		? `git worktree add ${mirror}/<branch with "/" replaced by "-"> -b <branch>`
+		: "git worktree add ../<name> -b <branch>";
 	return [
 		`pi-worktree-guard blocked \`${op}\` on the shared main checkout of ${toplevel}.`,
 		`Another live pi session holds it: pid ${rival.pid} on ${rival.host}, branch "${rival.branch}".`,
 		"Policy: one branch = one worktree = one agent. That session's uncommitted work lives here — do NOT stash, checkout, reset --hard or clean this checkout.",
 		"Options:",
-		"  1. Do the work in your own checkout: `herdr worktree create --branch <branch>` (or `git worktree add ../<name> -b <branch>`, then cd into it).",
+		`  1. Do the work in your own checkout: \`${addCmd}\`, then cd into it.`,
 		"  2. Ask the user to park or commit the other session's work first.",
 		"  3. Human override only: pi must be relaunched with PI_WORKTREE_GUARD=0 — you cannot disable the guard yourself.",
 	].join("\n");
+}
+
+/** Block reason for the first `git worktree add` outside its mirrored folder. */
+async function firstMisplacedAdd(pi: ExtensionAPI, adds: WorktreeAdd[]): Promise<string | null> {
+	for (const add of adds) {
+		const info = await repoInfo(pi, add.dir);
+		const mirror = info && mirroredRoot(info.commonDir);
+		const reason = mirror && locationViolation(add, mirror);
+		if (reason) return reason;
+	}
+	return null;
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -431,7 +542,10 @@ export default function (pi: ExtensionAPI): void {
 			if (typeof command !== "string" || command.length === 0) return undefined;
 
 			const baseDir = ctx.cwd ?? process.cwd();
-			const { hits, indirect } = scanCommand(command, baseDir);
+			const { hits, adds, indirect } = scanCommand(command, baseDir);
+			// A failed location probe must not skip the claim checks below.
+			const misplaced = await firstMisplacedAdd(pi, adds).catch(() => null);
+			if (misplaced) return { block: true, reason: misplaced };
 			if (hits.length === 0 && !indirect) return undefined;
 
 			const targets: MutationHit[] = hits.length
@@ -453,7 +567,7 @@ export default function (pi: ExtensionAPI): void {
 						"warn",
 					);
 				}
-				return { block: true, reason: blockReason(target.op, info.toplevel, rival) };
+				return { block: true, reason: blockReason(target.op, info, rival) };
 			}
 			return undefined;
 		} catch {

@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Worktree guard for pi \u2014 sessions claim the shared git checkout via heartbeat files under .git/pi-agent-claims/ and mutating git ops (stash/checkout/switch/reset --hard/clean) are blocked on the main checkout while another live pi session occupies it. Policy: one branch = one worktree = one agent.",
   "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
   "keywords": [
     "pi-package"
   ],

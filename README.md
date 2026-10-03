@@ -29,11 +29,24 @@ note.
    `drop`/`clear`/`save`/`store`/`create`/`branch`), `git checkout`,
    `git switch`, `git reset --hard`, `git clean -f…`.
 
+3. **Location** — `git worktree add <path>` is blocked for a repo inside the
+   workspace unless `<path>` sits under the repo's mirrored folder. The
+   workspace is the parent of `PI_WORKTREE_ROOT` (default `~/eden/.worktrees`),
+   so `~/eden/products/app` gets worktrees under
+   `~/eden/.worktrees/products/app/<branch>`, with `/` in the branch replaced
+   by `-`. The block reason gives the path to use instead. This applies to
+   every session, claimed or not. Repos outside the workspace and bare repos
+   are not checked. Like the claim checks, it reads plain `git worktree add`
+   calls; nested shells (`bash -c '…'`) and quoted paths containing spaces
+   are not parsed.
+
 ## What it does NOT block
 
-- Anything inside a **linked worktree** (`herdr worktree create`, `git
-  worktree add`). This assumes agents are assigned different worktrees.
-- Anything in a repo **no other live session claims** — single-agent flow is
+These exemptions apply to claim-based blocking. The location rule still applies.
+
+- Mutating ops inside a **linked worktree**. This assumes agents are assigned
+  different worktrees.
+- Mutating ops in a repo **no other live session claims** — single-agent flow is
   untouched, routine `git checkout` alone in the main checkout is fine.
 - `git stash list` / `git stash show` (read-only), non-`--hard` resets,
   non-forced cleans.
@@ -57,6 +70,8 @@ note.
 - Claim I/O errors and exceptions in the outer tool-call handler fail open.
   The guard only inspects pi `bash` calls; arbitrary edits, other tools, external
   processes, and two sessions sharing one linked worktree are outside its coverage.
+- `npm test` runs the parser and location tests in `tests/` with Node's
+  built-in TypeScript support (Node 22.18+).
 - Claims and check state live under `.git/` — nothing tracked by git, no
   merge noise, no repo pollution.
 
