@@ -161,7 +161,7 @@ function parseGit(argv: string[], cwd: string): GitCall | null {
 		const t = rest[i];
 		if (t === "-C") {
 			if (i + 1 >= rest.length) return null; // malformed — git errors on its own
-			dir = path.resolve(cwd, expandHome(unquote(rest[i + 1])));
+			dir = path.resolve(dir, expandHome(unquote(rest[i + 1])));
 			i += 2;
 			continue;
 		}
@@ -255,7 +255,7 @@ function centralRoot(): string {
 export function mirroredRoot(commonDir: string, central: string = centralRoot()): string | null {
 	if (path.basename(commonDir) !== ".git") return null;
 	const rel = path.relative(path.dirname(central), path.dirname(commonDir));
-	if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+	if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
 	return path.join(central, rel);
 }
 
@@ -267,12 +267,11 @@ function branchDir(branch: string): string {
 /** Block reason when `add.target` is outside `mirror`, else null. */
 export function locationViolation(add: WorktreeAdd, mirror: string): string | null {
 	if (add.target.startsWith(mirror + path.sep)) return null;
-	const name = branchDir(add.branch ?? path.basename(add.target));
-	const branchFlag = add.branch ? ` -b ${add.branch}` : "";
+	const dest = path.join(mirror, branchDir(add.branch ?? path.basename(add.target)));
 	return [
-		`pi-worktree-guard blocked \`git worktree add ${add.target}\`.`,
+		`pi-worktree-guard blocked \`git worktree add\` to ${add.target}.`,
 		`Worktrees for this repo go under ${mirror}/, one directory per branch with "/" replaced by "-".`,
-		`Run instead: git worktree add ${path.join(mirror, name)}${branchFlag}`,
+		`Rerun the same command with the worktree path replaced by ${dest}`,
 	].join("\n");
 }
 
@@ -544,7 +543,8 @@ export default function (pi: ExtensionAPI): void {
 
 			const baseDir = ctx.cwd ?? process.cwd();
 			const { hits, adds, indirect } = scanCommand(command, baseDir);
-			const misplaced = await firstMisplacedAdd(pi, adds);
+			// A failed location probe must not skip the claim checks below.
+			const misplaced = await firstMisplacedAdd(pi, adds).catch(() => null);
 			if (misplaced) return { block: true, reason: misplaced };
 			if (hits.length === 0 && !indirect) return undefined;
 
