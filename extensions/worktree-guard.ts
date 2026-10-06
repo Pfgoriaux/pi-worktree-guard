@@ -73,7 +73,7 @@ const STASH_WRITE_SUBCOMMANDS = new Set([
 const GIT_FLAG_WITH_VALUE = new Set(["-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 
 /** Interpreters/wrappers that hide a nested git invocation. */
-const INDIRECT_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ssh", "xargs", "envx"]);
+const INDIRECT_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ssh", "xargs", "env"]);
 
 /** `git worktree add` options that consume a separate value token. */
 const WORKTREE_ADD_FLAG_WITH_VALUE = new Set(["-b", "-B", "--reason"]);
@@ -264,6 +264,43 @@ function branchDir(branch: string): string {
 	return branch.replaceAll("/", "-");
 }
 
+/** Common env options are transparent; unknown forms stay on the indirect path. */
+function unwrapEnv(argv: string[], cwd: string): { argv: string[]; cwd: string } | null {
+	let i = 1;
+	while (i < argv.length) {
+		const token = argv[i++];
+		if (token === "--") return { argv: argv.slice(i), cwd };
+		if (/^[A-Za-z_]\w*=/.test(token) || ["-", "-i", "--ignore-environment"].includes(token)) continue;
+		if (token.startsWith("--unset=")) continue;
+		if (token === "-u" || token === "--unset") {
+			if (!argv[i]) return null;
+			i++;
+			continue;
+		}
+		if (token.startsWith("--chdir=")) {
+			cwd = path.resolve(cwd, expandHome(token.slice("--chdir=".length)));
+			continue;
+		}
+		if (token === "-C" || token === "--chdir") {
+			if (!argv[i]) return null;
+			cwd = path.resolve(cwd, expandHome(argv[i++]));
+			continue;
+		}
+		if (token.startsWith("-")) return null;
+		return { argv: argv.slice(i - 1), cwd };
+	}
+	return { argv: [], cwd };
+}
+
+function unwrapEnvs(argv: string[], cwd: string): { argv: string[]; cwd: string } | null {
+	while (path.basename(argv[0] ?? "") === "env") {
+		const command = unwrapEnv(argv, cwd);
+		if (!command) return null;
+		({ argv, cwd } = command);
+	}
+	return { argv, cwd };
+}
+
 /** Block reason when `add.target` is outside `mirror`, else null. */
 export function locationViolation(add: WorktreeAdd, mirror: string): string | null {
 	if (add.target.startsWith(mirror + path.sep)) return null;
@@ -300,8 +337,10 @@ export function scanCommand(
 		) {
 			i++;
 		}
-		const head = tokens[i];
-		const argv = tokens.slice(i);
+		const unwrapped = unwrapEnvs(tokens.slice(i), cwd);
+		if (!unwrapped) return { hits, adds, indirect: MUTATION_HINT_RE.test(command) };
+		const { argv, cwd: commandCwd } = unwrapped;
+		const head = argv[0];
 		if (head === "cd" || head === "pushd") {
 			const target = argv.slice(1).find((t) => !t.startsWith("-"));
 			if (target) {
@@ -310,9 +349,9 @@ export function scanCommand(
 			continue;
 		}
 		if (head === "git") {
-			const hit = gitMutation(argv, cwd);
+			const hit = gitMutation(argv, commandCwd);
 			if (hit) hits.push(hit);
-			const add = worktreeAdd(argv, cwd);
+			const add = worktreeAdd(argv, commandCwd);
 			if (add) adds.push(add);
 			continue;
 		}
@@ -389,7 +428,7 @@ function writeClaim(file: string, claim: Claim): void {
 
 function beat(claim: MyClaim): void {
 	// Never let a beat resurrect after shutdown removed us.
-	if (!fs.existsSync(claimsDir(path.dirname(claim.file)))) return;
+	if (!fs.existsSync(claim.file)) return;
 	const c: Claim = {
 		host: os.hostname(),
 		pid: process.pid,
