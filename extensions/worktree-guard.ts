@@ -73,7 +73,7 @@ const STASH_WRITE_SUBCOMMANDS = new Set([
 const GIT_FLAG_WITH_VALUE = new Set(["-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 
 /** Interpreters/wrappers that hide a nested git invocation. */
-const INDIRECT_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ssh", "xargs", "envx"]);
+const INDIRECT_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ssh", "xargs"]);
 
 /** `git worktree add` options that consume a separate value token. */
 const WORKTREE_ADD_FLAG_WITH_VALUE = new Set(["-b", "-B", "--reason"]);
@@ -264,6 +264,49 @@ function branchDir(branch: string): string {
 	return branch.replaceAll("/", "-");
 }
 
+/** Common env options are transparent; unknown forms stay on the indirect path. */
+function unwrapEnv(argv: string[], cwd: string): { argv: string[]; cwd: string } | null {
+	let i = 1;
+	let options = true;
+	while (i < argv.length) {
+		const token = argv[i++];
+		if (/^[A-Za-z_]\w*=/.test(token)) continue;
+		if (!options) return { argv: argv.slice(i - 1), cwd };
+		if (token === "--") {
+			options = false;
+			continue;
+		}
+		if (["-", "-i", "--ignore-environment"].includes(token)) continue;
+		if (token.startsWith("--unset=")) continue;
+		if (token === "-u" || token === "--unset") {
+			if (!argv[i]) return null;
+			i++;
+			continue;
+		}
+		if (token.startsWith("--chdir=")) {
+			cwd = path.resolve(cwd, expandHome(token.slice("--chdir=".length)));
+			continue;
+		}
+		if (token === "-C" || token === "--chdir") {
+			if (!argv[i]) return null;
+			cwd = path.resolve(cwd, expandHome(argv[i++]));
+			continue;
+		}
+		if (token.startsWith("-")) return null;
+		return { argv: argv.slice(i - 1), cwd };
+	}
+	return { argv: [], cwd };
+}
+
+function unwrapEnvs(argv: string[], cwd: string): { argv: string[]; cwd: string } | null {
+	while (path.basename(argv[0] ?? "") === "env") {
+		const command = unwrapEnv(argv, cwd);
+		if (!command) return null;
+		({ argv, cwd } = command);
+	}
+	return { argv, cwd };
+}
+
 /** Block reason when `add.target` is outside `mirror`, else null. */
 export function locationViolation(add: WorktreeAdd, mirror: string): string | null {
 	if (add.target.startsWith(mirror + path.sep)) return null;
@@ -291,6 +334,7 @@ export function scanCommand(
 	let cwd = baseDir;
 	const hits: MutationHit[] = [];
 	const adds: WorktreeAdd[] = [];
+	let indirect = false;
 	for (const segment of splitShell(command)) {
 		const tokens = segment.trim().split(/\s+/).filter(Boolean);
 		let i = 0;
@@ -300,9 +344,15 @@ export function scanCommand(
 		) {
 			i++;
 		}
-		const head = tokens[i];
-		const argv = tokens.slice(i);
+		const unwrapped = unwrapEnvs(tokens.slice(i), cwd);
+		if (!unwrapped) {
+			indirect ||= MUTATION_HINT_RE.test(command);
+			continue;
+		}
+		const { argv, cwd: commandCwd } = unwrapped;
+		const head = argv[0];
 		if (head === "cd" || head === "pushd") {
+			if (path.basename(tokens[i] ?? "") === "env") continue;
 			const target = argv.slice(1).find((t) => !t.startsWith("-"));
 			if (target) {
 				cwd = path.resolve(cwd, expandHome(unquote(target)));
@@ -310,17 +360,17 @@ export function scanCommand(
 			continue;
 		}
 		if (head === "git") {
-			const hit = gitMutation(argv, cwd);
+			const hit = gitMutation(argv, commandCwd);
 			if (hit) hits.push(hit);
-			const add = worktreeAdd(argv, cwd);
+			const add = worktreeAdd(argv, commandCwd);
 			if (add) adds.push(add);
 			continue;
 		}
 		if (head !== undefined && INDIRECT_SHELLS.has(head) && MUTATION_HINT_RE.test(command)) {
-			return { hits, adds, indirect: true };
+			indirect = true;
 		}
 	}
-	return { hits, adds, indirect: false };
+	return { hits, adds, indirect };
 }
 
 // ---------------------------------------------------------------------------
@@ -384,12 +434,19 @@ function claimsDir(commonDir: string): string {
 
 function writeClaim(file: string, claim: Claim): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, `${JSON.stringify(claim, null, "\t")}\n`);
+	const temporary = `${file}.tmp`;
+	try {
+		fs.writeFileSync(temporary, `${JSON.stringify(claim, null, "\t")}\n`);
+		fs.renameSync(temporary, file);
+	} finally {
+		fs.rmSync(temporary, { force: true });
+	}
 }
 
 function beat(claim: MyClaim): void {
-	// Never let a beat resurrect after shutdown removed us.
-	if (!fs.existsSync(claimsDir(path.dirname(claim.file)))) return;
+	// A live session can recover a stale claim removed by a rival after sleep.
+	// Shutdown clears the timer and myClaims, so it cannot recreate a claim.
+	if (!fs.existsSync(path.dirname(claim.file))) return;
 	const c: Claim = {
 		host: os.hostname(),
 		pid: process.pid,
@@ -398,7 +455,7 @@ function beat(claim: MyClaim): void {
 		lastBeat: Date.now(),
 	};
 	try {
-		fs.writeFileSync(claim.file, `${JSON.stringify(c, null, "\t")}\n`);
+		writeClaim(claim.file, c);
 	} catch {
 		// Another process cleaned our claim dir mid-removal; next beat is fine.
 	}
@@ -548,9 +605,8 @@ export default function (pi: ExtensionAPI): void {
 			if (misplaced) return { block: true, reason: misplaced };
 			if (hits.length === 0 && !indirect) return undefined;
 
-			const targets: MutationHit[] = hits.length
-				? hits
-				: [{ op: "git (indirect nested invocation)", dir: baseDir }];
+			const targets: MutationHit[] = [...hits];
+			if (indirect) targets.push({ op: "git (indirect nested invocation)", dir: baseDir });
 
 			for (const target of targets) {
 				const info = await repoInfo(pi, target.dir);

@@ -18,7 +18,7 @@ it does not enforce exclusive ownership of every worktree. See [README.md](READM
   shell sandbox or a fail-closed filesystem boundary.
 - Claim files stay under `.git/`. Keep routine read-only Git operations usable;
   the scanner conservatively blocks `checkout`, including path-restoration forms.
-- No build step. `npm test` runs the parser and location tests in `tests/`.
+- No build step. `npm test` runs the parser, location, and claim tests in `tests/`.
   Parser and claim-lifecycle changes need deterministic regression tests; a
   prose guarantee is not a substitute for those checks.
 - The location rule blocks `git worktree add` outside
