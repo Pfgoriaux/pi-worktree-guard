@@ -6,7 +6,7 @@ import test from "node:test";
 import guard, { scanCommand } from "../extensions/worktree-guard.ts";
 
 test("env wrappers preserve Git mutations and worktree destinations", () => {
-	for (const prefix of ["env", "/usr/bin/env", "env FOO=bar", "env -i", "env -u FOO", "env --unset=FOO --", "env env"]) {
+	for (const prefix of ["env", "/usr/bin/env", "env FOO=bar", "env -i", "env -u FOO", "env --unset=FOO --", "env -- FOO=bar", "env env"]) {
 		assert.deepEqual(scanCommand(`${prefix} git stash`, "/fixture").hits, [{ op: "stash", dir: "/fixture" }]);
 		assert.deepEqual(scanCommand(`${prefix} git worktree add /tmp/outside -b feature`, "/fixture").adds, [
 			{ dir: "/fixture", target: "/tmp/outside", branch: "feature" },
@@ -17,9 +17,13 @@ test("env wrappers preserve Git mutations and worktree destinations", () => {
 	assert.equal(scanCommand("env -C /other git stash; git stash", "/fixture").hits[1].dir, "/fixture");
 	assert.equal(scanCommand("env --chdir=/other git stash", "/fixture").hits[0].dir, "/other");
 	assert.equal(scanCommand("env -S 'git stash'", "/fixture").indirect, true);
+	assert.equal(scanCommand("env -S x; git worktree add /tmp/o -b f", "/fixture").adds[0].target, "/tmp/o");
+	assert.equal(scanCommand("env -v true; git -C /other stash", "/fixture").hits[0].dir, "/other");
+	assert.equal(scanCommand("env cd /other; git stash", "/fixture").hits[0].dir, "/fixture");
+	assert.equal(scanCommand("sh -c 'git stash'; git worktree add /tmp/o", "/fixture").adds[0].target, "/tmp/o");
 });
 
-test("heartbeat keeps claims fresh and never recreates a removed claim", async (t) => {
+test("heartbeat keeps claims fresh, recovers deleted claims, and stops on shutdown", async (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "guard-claims-"));
 	const git = path.join(root, ".git");
 	fs.mkdirSync(git);
@@ -43,8 +47,11 @@ test("heartbeat keeps claims fresh and never recreates a removed claim", async (
 	assert.equal(read().lastBeat, initial + 11 * 60 * 1000);
 	fs.rmSync(file);
 	t.mock.timers.tick(30000);
-	assert.equal(fs.existsSync(file), false);
+	assert.equal(read().lastBeat, Date.now());
+	assert.deepEqual(fs.readdirSync(directory), [path.basename(file)], "atomic write leaves no temporary file");
 	hooks.get("session_shutdown")?.();
+	t.mock.timers.tick(30000);
+	assert.equal(fs.existsSync(file), false);
 });
 
 test("the tool-call hook blocks env mutations and misplaced worktrees in an isolated checkout", async (t) => {
